@@ -1,0 +1,6 @@
+# Raw source catalogs (download via scripts/README.md)
+data/
+*.csv
+*.dat
+*.dat.gz
+*.csv.gz
