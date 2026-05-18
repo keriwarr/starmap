@@ -47,10 +47,28 @@ OUT_PATH  = ROOT / 'stars.json'
 HYG_R_MAX_PC    = 200.0     # keep HYG out to here (constellation backbones live here)
 GCNS_R_MAX_PC   = 100.0     # GCNS's native horizon
 GCNS_MAG_LIMIT  = 14.0      # Gaia G; bump up for more dim fillers (at file-size cost)
-SKY_TOL_ARCSEC  = 2.0       # cross-catalog dedup tolerance after PM correction
-EPOCH_DT_YEARS  = 16.0      # J2000 (HYG) -> J2016 (Gaia EDR3)
+SKY_TOL_ARCSEC      = 120.0 # cross-catalog dedup tolerance; absorbs PM-correction
+                            # residuals for high-PM HYG stars whose Hipparcos PM
+                            # values don't quite align HYG with Gaia EDR3 J2016
+SKY_DEDUP_MAG_TOL   = 2.5   # only treat as same star if mags also agree. Loose
+                            # enough for V vs G band differences on red M dwarfs
+                            # (~1.5–2.5 mag); tight enough to keep random HYG/GCNS
+                            # sky alignments of different physical stars apart.
+EPOCH_DT_YEARS      = 16.0  # J2000 (HYG) -> J2016 (Gaia EDR3)
+GCNS_DEDUP_ARCSEC   = 1.0   # within-GCNS: tight tolerance; only catches Gaia source duplicates
+GCNS_DEDUP_MAG_TOL  = 0.5   # within-GCNS: also require |Δmag| < this so real binaries stay separate
+FINAL_TOL_ARCSEC    = 30.0  # any pair at this sky sep AND with notable abs. distance gap...
+FINAL_DIST_TOL_PC   = 0.10  # ...is treated as a same-star duplicate. 0.1 pc is treated as
+                            # the practical upper bound for gravitationally-bound binaries.
 SKY_TOL_RAD     = SKY_TOL_ARCSEC / 3600.0 * math.pi / 180.0
-SKY_CELL        = SKY_TOL_RAD  # cell size = tolerance; ±1 cell search covers it
+SKY_CELL        = SKY_TOL_RAD
+GCNS_DEDUP_RAD  = GCNS_DEDUP_ARCSEC / 3600.0 * math.pi / 180.0
+GCNS_DEDUP_CELL = GCNS_DEDUP_RAD
+FINAL_TOL_RAD   = FINAL_TOL_ARCSEC / 3600.0 * math.pi / 180.0
+FINAL_CELL      = FINAL_TOL_RAD
+
+# Each output row is [name, x, y, z, mag, spect, origin] where origin is 'H' (HYG) or 'G' (GCNS).
+# Origin is set at row-creation time by the pipeline — never reconstructed from xyz post-hoc.
 
 # --- HYG --------------------------------------------------------------------
 _PROPER_BLOCKLIST = re.compile(r'^(HIP|HD|Gl|GJ|ID|TYC|2MASS)\s', re.I)
@@ -97,7 +115,17 @@ def hyg_pm_corrected_uvec(r):
     return (cd * math.cos(rar), cd * math.sin(rar), math.sin(decr))
 
 def load_hyg_and_sky_index(r_max):
-    """Return (rows, sky_grid). rows are output-ready [name, x, y, z, mag, spect]."""
+    """Return (rows, sky_grid). rows are output-ready [name, x, y, z, mag, spect, origin].
+    sky_grid maps cell -> list of (ux, uy, uz, mag) at J2016 epoch.
+
+    Emits HYG positions at J2016 (Gaia EDR3 epoch), not J2000. Two reasons:
+      1. Cross-catalog dedup against GCNS (also J2016) becomes a same-epoch
+         comparison, removing PM-drift residual.
+      2. The rendered star positions reflect where stars actually *are* now,
+         not where they were 25 years ago. Matters most for nearby M dwarfs
+         (Barnard's, GJ 1128, ...) with >1"/yr proper motion.
+    Stars without parseable ra/dec fall back to HYG's raw xyz (no correction).
+    """
     rows = []
     grid = defaultdict(list)
     with HYG_PATH.open() as f:
@@ -105,21 +133,32 @@ def load_hyg_and_sky_index(r_max):
             try:
                 d = float(r['dist'])
                 if d > r_max: continue
-                x = round(float(r['x']), 3)
-                y = round(float(r['y']), 3)
-                z = round(float(r['z']), 3)
                 mag = float(r['mag']) if r['mag'] else None
             except (TypeError, ValueError):
                 continue
             n = r['proper'] or ''
             n = n if is_proper(n) else ''
+
+            u = hyg_pm_corrected_uvec(r)
+            if u is None:
+                # No ra/dec — emit raw xyz unchanged.
+                try:
+                    x = round(float(r['x']), 3)
+                    y = round(float(r['y']), 3)
+                    z = round(float(r['z']), 3)
+                except (TypeError, ValueError):
+                    continue
+            else:
+                ux, uy, uz = u
+                x = round(ux * d, 3)
+                y = round(uy * d, 3)
+                z = round(uz * d, 3)
+                grid[(int(ux/SKY_CELL), int(uy/SKY_CELL), int(uz/SKY_CELL))].append((ux, uy, uz, mag))
+
             rows.append([n, x, y, z,
                          round(mag, 2) if mag is not None else None,
-                         spect_class_hyg(r['spect'])])
-            u = hyg_pm_corrected_uvec(r)
-            if u is None: continue
-            ux, uy, uz = u
-            grid[(int(ux/SKY_CELL), int(uy/SKY_CELL), int(uz/SKY_CELL))].append((ux, uy, uz))
+                         spect_class_hyg(r['spect']),
+                         'H'])
     return rows, grid
 
 # --- GCNS -------------------------------------------------------------------
@@ -180,15 +219,20 @@ def parse_gcns_row(line):
     except (ValueError, IndexError):
         return None
 
-def has_sky_match(grid, ux, uy, uz):
+def has_sky_match(grid, ux, uy, uz, gmag):
+    """Returns True if any HYG entry is within SKY_TOL_RAD on the sky AND
+    within SKY_DEDUP_MAG_TOL in magnitude. Mag check prevents widely-separated
+    random HYG/GCNS sky alignments (different physical stars) from being
+    falsely merged when we use a wide sky tolerance for PM-correction slack."""
     cx, cy, cz = int(ux/SKY_CELL), int(uy/SKY_CELL), int(uz/SKY_CELL)
     t2 = SKY_TOL_RAD * SKY_TOL_RAD
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             for dz in (-1, 0, 1):
-                for hx, hy, hz in grid.get((cx+dx, cy+dy, cz+dz), ()):
-                    if (hx-ux)**2 + (hy-uy)**2 + (hz-uz)**2 <= t2:
-                        return True
+                for hx, hy, hz, hmag in grid.get((cx+dx, cy+dy, cz+dz), ()):
+                    if (hx-ux)**2 + (hy-uy)**2 + (hz-uz)**2 > t2: continue
+                    if hmag is None or abs(hmag - gmag) > SKY_DEDUP_MAG_TOL: continue
+                    return True
     return False
 
 # --- main -------------------------------------------------------------------
@@ -204,9 +248,12 @@ def main():
     named = sum(1 for r in hyg if r[0])
     print(f'  {len(hyg)} HYG stars ({named} proper-named).')
 
-    print(f'GCNS: streaming table1c, sky dedup at {SKY_TOL_ARCSEC}", mag G < {GCNS_MAG_LIMIT}...')
-    gcns_only = []
-    kept = matched = rejected = 0
+    print(f'GCNS: streaming, dedup vs HYG at {SKY_TOL_ARCSEC}"; '
+          f'intra-GCNS at {GCNS_DEDUP_ARCSEC}" + |Δmag|<{GCNS_DEDUP_MAG_TOL}; '
+          f'mag G < {GCNS_MAG_LIMIT}...')
+    gcns_only = []                 # output rows
+    gcns_grid = defaultdict(list)  # cell -> list of (ux, uy, uz, idx_in_gcns_only)
+    kept = matched_hyg = matched_gcns = rejected = 0
     with gzip.open(GCNS_PATH, 'rt', encoding='latin-1') as f:
         for line in f:
             p = parse_gcns_row(line)
@@ -215,16 +262,96 @@ def main():
             if prob < 0.5 or gmag > GCNS_MAG_LIMIT:
                 rejected += 1; continue
             ux, uy, uz = radec_to_uvec(ra, dec)
-            if has_sky_match(sky_grid, ux, uy, uz):
-                matched += 1; continue
+
+            # 1. HYG cross-catalog dedup — same direction + similar mag.
+            if has_sky_match(sky_grid, ux, uy, uz, gmag):
+                matched_hyg += 1; continue
+
+            # 2. Intra-GCNS dedup — same star resolved as multiple Gaia source IDs.
+            # Require both tight sky tolerance AND similar mag so real tight
+            # binaries Gaia resolved into A+B with different brightnesses stay.
+            gcx = int(ux / GCNS_DEDUP_CELL); gcy = int(uy / GCNS_DEDUP_CELL); gcz = int(uz / GCNS_DEDUP_CELL)
+            duplicate_idx = -1
+            t2 = GCNS_DEDUP_RAD * GCNS_DEDUP_RAD
+            for ddx in (-1, 0, 1):
+                if duplicate_idx >= 0: break
+                for ddy in (-1, 0, 1):
+                    if duplicate_idx >= 0: break
+                    for ddz in (-1, 0, 1):
+                        for vx, vy, vz, idx in gcns_grid.get((gcx+ddx, gcy+ddy, gcz+ddz), ()):
+                            if (vx-ux)**2 + (vy-uy)**2 + (vz-uz)**2 > t2: continue
+                            other_mag = gcns_only[idx][4]
+                            if other_mag is None or abs(other_mag - gmag) > GCNS_DEDUP_MAG_TOL: continue
+                            duplicate_idx = idx; break
+                        if duplicate_idx >= 0: break
+            if duplicate_idx >= 0:
+                matched_gcns += 1
+                # If current row is brighter, replace; otherwise just skip.
+                existing = gcns_only[duplicate_idx]
+                if gmag < (existing[4] if existing[4] is not None else 99):
+                    x, y, z = radec_to_xyz(ra, dec, dist_pc)
+                    gcns_only[duplicate_idx] = ['', round(x, 3), round(y, 3), round(z, 3),
+                                               round(gmag, 2), spect_from_bp_rp(bp_rp), 'G']
+                continue
+
             x, y, z = radec_to_xyz(ra, dec, dist_pc)
             gcns_only.append(['', round(x, 3), round(y, 3), round(z, 3),
-                              round(gmag, 2), spect_from_bp_rp(bp_rp)])
+                              round(gmag, 2), spect_from_bp_rp(bp_rp), 'G'])
+            gcns_grid[(gcx, gcy, gcz)].append((ux, uy, uz, len(gcns_only) - 1))
             kept += 1
-    print(f'  GCNS kept: {kept}, dropped-as-HYG-dup: {matched}, otherwise rejected: {rejected}')
+    print(f'  GCNS kept: {kept}, dropped-vs-HYG: {matched_hyg}, '
+          f'dropped-vs-GCNS: {matched_gcns}, otherwise rejected: {rejected}')
 
     combined = hyg + gcns_only
+
+    # Final ray-killer pass. Catches same-star duplicates that escaped the
+    # catalog-specific dedup steps (HYG entries with multiple Hipparcos
+    # solutions, HYG-vs-GCNS pairs with edge-case proper motion, etc.) by a
+    # purely positional rule: same sky direction + meaningfully different
+    # distance = catalog ghost, not a real pair. Real binaries are
+    # physically co-located (Δd ≈ 0) so they pass through. Among matches,
+    # we keep the named entry, else the brighter entry.
     def dist(row): return math.sqrt(row[1]**2 + row[2]**2 + row[3]**2)
+    final_grid = defaultdict(list)
+    for i, row in enumerate(combined):
+        if row[0] == 'Sol': continue
+        d = dist(row)
+        if d < 1e-6: continue
+        ux, uy, uz = row[1]/d, row[2]/d, row[3]/d
+        key = (int(ux/FINAL_CELL), int(uy/FINAL_CELL), int(uz/FINAL_CELL))
+        final_grid[key].append((i, ux, uy, uz, d))
+
+    dropped = set()
+    t2 = FINAL_TOL_RAD * FINAL_TOL_RAD
+    for k, b in final_grid.items():
+        cx, cy, cz = k
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    ob = final_grid.get((cx+dx, cy+dy, cz+dz))
+                    if not ob: continue
+                    for i, ux, uy, uz, ri in b:
+                        if i in dropped: continue
+                        for j, vx, vy, vz, rj in ob:
+                            if i >= j or j in dropped: continue
+                            if (ux-vx)**2 + (uy-vy)**2 + (uz-vz)**2 > t2: continue
+                            if abs(ri - rj) < FINAL_DIST_TOL_PC: continue
+                            ri_row, rj_row = combined[i], combined[j]
+                            i_has_name = bool(ri_row[0]); j_has_name = bool(rj_row[0])
+                            i_mag = ri_row[4] if ri_row[4] is not None else 99
+                            j_mag = rj_row[4] if rj_row[4] is not None else 99
+                            # Drop unnamed first; else drop fainter.
+                            drop_j = i_has_name and not j_has_name
+                            drop_i = j_has_name and not i_has_name
+                            if not drop_i and not drop_j:
+                                if i_mag <= j_mag: drop_j = True
+                                else: drop_i = True
+                            if drop_j: dropped.add(j)
+                            else: dropped.add(i); break
+    if dropped:
+        print(f'  Final ray-killer pass: dropped {len(dropped)} same-direction-disagreeing-distance rows.')
+        combined = [r for k, r in enumerate(combined) if k not in dropped]
+
     combined.sort(key=dist)
 
     r_1000 = dist(combined[1000]) if len(combined) > 1000 else dist(combined[-1])

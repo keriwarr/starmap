@@ -521,20 +521,23 @@ function buildStars(payload) {
   starGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   starGeom.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
   const starMat = new THREE.ShaderMaterial({
-    uniforms: { map: { value: tex } },
+    uniforms: {
+      map: { value: tex },
+      // Per-frame mode-dependent cap on point pixel size. In FROM-SOL view,
+      // nearby stars (Sirius / α Cen) explode into huge blobs because of the
+      // 1/z scaling — clamp to a small max. In ORBIT view we want the full
+      // 1/z scaling so the camera dive-in feels 3D.
+      uMaxPx: { value: 1e4 },
+    },
     vertexShader: `
       attribute float size;
       attribute vec3 color;
+      uniform float uMaxPx;
       varying vec3 vColor;
-      // Cap the absolute pixel size — without this, stars within a few pc of
-      // the camera (Sirius / α Cen / etc. in FROM-SOL view) explode into
-      // huge blobs because of the 1/z scaling. Distant stars still shrink
-      // normally, so the far sky stays satisfyingly full.
-      const float MAX_PX = 14.0;
       void main() {
         vColor = color;
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = min(MAX_PX, size * (300.0 / -mv.z));
+        gl_PointSize = min(uMaxPx, size * (300.0 / -mv.z));
         gl_Position = projectionMatrix * mv;
       }
     `,
@@ -769,6 +772,7 @@ function applyViewMode(newMode) {
     if (sceneCtx) {
       sceneCtx.stemLines.visible = false;
       sceneCtx.connLines.visible = false;
+      sceneCtx.starsPoints.material.uniforms.uMaxPx.value = 14;
     }
 
     skyControls.reset(0, 0);
@@ -786,6 +790,7 @@ function applyViewMode(newMode) {
     if (sceneCtx) {
       sceneCtx.stemLines.visible = true;
       sceneCtx.connLines.visible = true;
+      sceneCtx.starsPoints.material.uniforms.uMaxPx.value = 1e4;
     }
   }
   mode = newMode;
